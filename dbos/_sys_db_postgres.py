@@ -69,6 +69,11 @@ class PostgresSystemDatabase(SystemDatabase):
                 conn.close()
             ensure_dbos_schema(self.engine, self.schema)
             run_dbos_migrations(self.engine, self.schema, self.use_listen_notify)
+            # Extend partitions on every startup
+            with self.engine.begin() as maint_conn:
+                maint_conn.execute(
+                    sa.text(f'CALL "{self.schema}".maintain_partitions()')
+                )
         finally:
             if locked:
                 conn.execute(

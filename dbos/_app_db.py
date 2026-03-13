@@ -82,7 +82,7 @@ class ApplicationDatabase(ABC):
         if database_url.startswith("sqlite"):
             self.schema = None
         else:
-            self.schema = schema if schema else "dbos"
+            self.schema = schema if schema else "dbosdirac"
         ApplicationSchema.transaction_outputs.schema = schema
         self.engine = self._create_engine(database_url, engine_kwargs)
         self._engine_kwargs = engine_kwargs
@@ -259,7 +259,20 @@ class PostgresApplicationDatabase(ApplicationDatabase):
         finally:
             postgres_db_engine.dispose()
 
-        # Create the dbos schema and transaction_outputs table in the application database
+        # Rename old "dbos" schema to "dbosdirac" if applicable
+        with self.engine.begin() as conn:
+            conn.execute(
+                sa.text("""
+                    DO $$ BEGIN
+                      IF EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = 'dbos')
+                        AND NOT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = 'dbosdirac') THEN
+                        ALTER SCHEMA "dbos" RENAME TO "dbosdirac";
+                      END IF;
+                    END $$;
+                """)
+            )
+
+        # Create the schema and transaction_outputs table in the application database
         with self.engine.begin() as conn:
             # Check if schema exists first
             schema_exists = conn.execute(
@@ -273,25 +286,146 @@ class PostgresApplicationDatabase(ApplicationDatabase):
                 schema_creation_query = sa.text(f'CREATE SCHEMA "{self.schema}"')
                 conn.execute(schema_creation_query)
 
-        inspector = inspect(self.engine)
-        if not inspector.has_table("transaction_outputs", schema=self.schema):
-            ApplicationSchema.metadata_obj.create_all(self.engine)
-        else:
-            columns = inspector.get_columns("transaction_outputs", schema=self.schema)
-            column_names = [col["name"] for col in columns]
+        # Convert transaction_outputs to partitioned table or create fresh
+        with self.engine.begin() as conn:
+            conn.execute(
+                sa.text(f"""
+                    DO $$ BEGIN
+                      IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = '{self.schema}' AND tablename = 'transaction_outputs')
+                        AND NOT EXISTS (SELECT 1 FROM pg_partitioned_table pt
+                                        JOIN pg_class c ON pt.partrelid = c.oid
+                                        JOIN pg_namespace n ON c.relnamespace = n.oid
+                                        WHERE n.nspname = '{self.schema}' AND c.relname = 'transaction_outputs') THEN
+                        -- Existing non-partitioned table: rename, create partitioned, migrate data, drop old
+                        ALTER TABLE "{self.schema}".transaction_outputs RENAME TO transaction_outputs_old;
 
-            if "function_name" not in column_names:
-                # Column missing, alter table to add it
-                with self.engine.connect() as conn:
-                    conn.execute(
-                        text(
-                            f"""
-                        ALTER TABLE \"{self.schema}\".transaction_outputs
-                        ADD COLUMN function_name TEXT NOT NULL DEFAULT '';
-                        """
-                        )
-                    )
-                    conn.commit()
+                        CREATE TABLE "{self.schema}".transaction_outputs (
+                            workflow_uuid TEXT NOT NULL,
+                            function_id INT4 NOT NULL,
+                            output TEXT,
+                            error TEXT,
+                            txn_id TEXT,
+                            txn_snapshot TEXT,
+                            executor_id TEXT,
+                            function_name TEXT NOT NULL DEFAULT '',
+                            created_at BIGINT NOT NULL DEFAULT (EXTRACT(epoch FROM now()) * 1000.0)::bigint,
+                            PRIMARY KEY (workflow_uuid, function_id)
+                        ) PARTITION BY RANGE (workflow_uuid);
+
+                        CREATE TABLE "{self.schema}".transaction_outputs_default PARTITION OF "{self.schema}".transaction_outputs DEFAULT;
+
+                        CREATE INDEX transaction_outputs_created_at_index ON "{self.schema}".transaction_outputs (created_at);
+
+                        INSERT INTO "{self.schema}".transaction_outputs SELECT * FROM "{self.schema}".transaction_outputs_old;
+                        DROP TABLE "{self.schema}".transaction_outputs_old CASCADE;
+
+                      ELSIF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = '{self.schema}' AND tablename = 'transaction_outputs') THEN
+                        -- Fresh install: create partitioned table directly
+                        CREATE TABLE "{self.schema}".transaction_outputs (
+                            workflow_uuid TEXT NOT NULL,
+                            function_id INT4 NOT NULL,
+                            output TEXT,
+                            error TEXT,
+                            txn_id TEXT,
+                            txn_snapshot TEXT,
+                            executor_id TEXT,
+                            function_name TEXT NOT NULL DEFAULT '',
+                            created_at BIGINT NOT NULL DEFAULT (EXTRACT(epoch FROM now()) * 1000.0)::bigint,
+                            PRIMARY KEY (workflow_uuid, function_id)
+                        ) PARTITION BY RANGE (workflow_uuid);
+
+                        CREATE TABLE "{self.schema}".transaction_outputs_default PARTITION OF "{self.schema}".transaction_outputs DEFAULT;
+
+                        CREATE INDEX transaction_outputs_created_at_index ON "{self.schema}".transaction_outputs (created_at);
+                      ELSE
+                        -- Already partitioned, check for missing columns
+                        IF NOT EXISTS (
+                          SELECT 1 FROM information_schema.columns
+                          WHERE table_schema = '{self.schema}' AND table_name = 'transaction_outputs' AND column_name = 'function_name'
+                        ) THEN
+                          ALTER TABLE "{self.schema}".transaction_outputs ADD COLUMN function_name TEXT NOT NULL DEFAULT '';
+                        END IF;
+                      END IF;
+                    END $$;
+                """)
+            )
+
+        # Create or replace maintain_partitions procedure for app DB.
+        # Use a separate transaction so failure doesn't affect the main migration.
+        try:
+            with self.engine.begin() as proc_conn:
+                proc_conn.execute(
+                    sa.text(f"""
+                        CREATE OR REPLACE PROCEDURE "{self.schema}".maintain_partitions()
+                        LANGUAGE plpgsql AS $proc$
+                        DECLARE
+                            week_start TIMESTAMP WITH TIME ZONE;
+                            week_end TIMESTAMP WITH TIME ZONE;
+                            week_label TEXT;
+                            uuid_lower TEXT;
+                            uuid_upper TEXT;
+                            sched_lower TEXT;
+                            sched_upper TEXT;
+                            epoch_ms_lower BIGINT;
+                            epoch_ms_upper BIGINT;
+                            hex_lower TEXT;
+                            hex_upper TEXT;
+                            part_name TEXT;
+                            i INTEGER;
+                        BEGIN
+                            FOR i IN -1..4 LOOP
+                                week_start := date_trunc('week', now()) + (i * INTERVAL '1 week');
+                                week_end := week_start + INTERVAL '1 week';
+                                week_label := to_char(week_start, 'IYYY') || 'w' || lpad(to_char(week_start, 'IW'), 2, '0');
+
+                                epoch_ms_lower := (EXTRACT(epoch FROM week_start) * 1000)::BIGINT;
+                                epoch_ms_upper := (EXTRACT(epoch FROM week_end) * 1000)::BIGINT;
+                                hex_lower := lpad(to_hex(epoch_ms_lower), 12, '0');
+                                hex_upper := lpad(to_hex(epoch_ms_upper), 12, '0');
+                                uuid_lower := substring(hex_lower from 1 for 8) || '-' || substring(hex_lower from 9 for 4) || '-7';
+                                uuid_upper := substring(hex_upper from 1 for 8) || '-' || substring(hex_upper from 9 for 4) || '-7';
+
+                                sched_lower := 'sched-' || to_char(week_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS');
+                                sched_upper := 'sched-' || to_char(week_end AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS');
+
+                                -- UUIDv7 partition
+                                part_name := 'transaction_outputs_' || week_label || '_uuid';
+                                IF NOT EXISTS (
+                                    SELECT 1 FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
+                                    WHERE n.nspname = '{self.schema}' AND c.relname = part_name
+                                ) THEN
+                                    EXECUTE format(
+                                        'CREATE TABLE "{self.schema}".%I PARTITION OF "{self.schema}".transaction_outputs FOR VALUES FROM (%L) TO (%L)',
+                                        part_name, uuid_lower, uuid_upper
+                                    );
+                                END IF;
+
+                                -- sched-* partition
+                                part_name := 'transaction_outputs_' || week_label || '_sched';
+                                IF NOT EXISTS (
+                                    SELECT 1 FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
+                                    WHERE n.nspname = '{self.schema}' AND c.relname = part_name
+                                ) THEN
+                                    EXECUTE format(
+                                        'CREATE TABLE "{self.schema}".%I PARTITION OF "{self.schema}".transaction_outputs FOR VALUES FROM (%L) TO (%L)',
+                                        part_name, sched_lower, sched_upper
+                                    );
+                                END IF;
+                            END LOOP;
+                        END;
+                        $proc$;
+                    """)
+                )
+        except Exception:
+            # If the role doesn't have CREATE privilege, the procedure
+            # should already exist from migration. Just log and continue.
+            dbos_logger.debug(
+                "Could not create maintain_partitions procedure (may already exist from migration)"
+            )
+
+        # Call maintain_partitions to create/extend partitions
+        with self.engine.begin() as maint_conn:
+            maint_conn.execute(sa.text(f'CALL "{self.schema}".maintain_partitions()'))
 
     def _is_unique_constraint_violation(self, dbapi_error: DBAPIError) -> bool:
         """Check if the error is a unique constraint violation in PostgreSQL."""

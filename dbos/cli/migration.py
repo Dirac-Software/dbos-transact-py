@@ -12,7 +12,7 @@ def run_dbos_database_migrations(
     system_database_url: str,
     *,
     app_database_url: Optional[str] = None,
-    schema: str = "dbos",
+    schema: str = "dbosdirac",
     application_role: Optional[str] = None,
 ) -> None:
     # First, run DBOS migrations on the system database and (optionally) the application database
@@ -93,8 +93,9 @@ def grant_dbos_schema_permissions(
         with engine.connect() as connection:
             connection.execution_options(isolation_level="AUTOCOMMIT")
 
-            # Grant usage on the system schema
-            sql = f'GRANT USAGE ON SCHEMA "{schema}" TO "{role_name}"'
+            # Grant usage and create on the system schema
+            # CREATE is needed for maintain_partitions() to create partition tables
+            sql = f'GRANT USAGE, CREATE ON SCHEMA "{schema}" TO "{role_name}"'
             typer.echo(sql)
             connection.execute(sa.text(sql))
 

@@ -519,7 +519,7 @@ class DBOS:
             self._background_event_loop.start()
             assert self._config["database"]["sys_db_engine_kwargs"] is not None
             # Get the schema configuration, use "dbos" as default
-            schema = self._config.get("dbos_system_schema", "dbos")
+            schema = self._config.get("dbos_system_schema", "dbosdirac")
             dbos_logger.debug("Creating system database")
             self._notification_listener_polling_interval_sec = (
                 self._config.get("runtimeConfig", {}).get(

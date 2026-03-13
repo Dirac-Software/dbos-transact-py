@@ -62,7 +62,7 @@ class _ScheduleThread:
             if self._stop_event.wait(timeout=sleep_time + jitter):
                 return
             try:
-                workflow_id = f"sched-{self.schedule_name}-{next_exec_time.isoformat()}"
+                workflow_id = f"sched-{next_exec_time.isoformat()}-{self.schedule_name}"
                 if not dbos._sys_db.get_workflow_status(workflow_id):
                     _enqueue_scheduled_workflow(
                         dbos._sys_db,
@@ -163,7 +163,7 @@ def backfill_schedule(
         next_time = it.get_next(datetime)
         if next_time >= end:
             break
-        workflow_id = f"sched-{schedule_name}-{next_time.isoformat()}"
+        workflow_id = f"sched-{next_time.isoformat()}-{schedule_name}"
         if not sys_db.get_workflow_status(workflow_id):
             _enqueue_scheduled_workflow(
                 sys_db,
@@ -185,7 +185,7 @@ def trigger_schedule(sys_db: "SystemDatabase", schedule_name: str) -> str:
     context = sys_db.serializer.deserialize(schedule["context"])
     class_name = schedule["workflow_class_name"]
     now = datetime.now(timezone.utc)
-    workflow_id = f"sched-{schedule_name}-trigger-{now.isoformat()}"
+    workflow_id = f"sched-{now.isoformat()}-trigger-{schedule_name}"
     _enqueue_scheduled_workflow(
         sys_db, schedule["workflow_name"], now, workflow_id, context, class_name
     )

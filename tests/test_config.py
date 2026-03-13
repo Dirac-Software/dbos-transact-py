@@ -877,7 +877,7 @@ def test_overwrite_config_minimal(mocker):
     assert config["name"] == "stock-prices"
     assert config["database_url"] == exported_db_url
     assert config["system_database_url"] == exported_sys_db_url
-    assert config["dbos_system_schema"] == "dbos"
+    assert config["dbos_system_schema"] == "dbosdirac"
     assert config["telemetry"]["OTLPExporter"]["tracesEndpoint"] == [
         "thetracesendpoint"
     ]

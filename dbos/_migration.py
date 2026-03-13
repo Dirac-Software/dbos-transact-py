@@ -441,6 +441,630 @@ ALTER TABLE "{schema}".workflow_schedules ADD COLUMN "cron_timezone" TEXT DEFAUL
 """
 
 
+def get_dbos_migration_sixteen(schema: str, use_listen_notify: bool) -> str:
+    # Step 5a: Rename schema "dbos" -> "dbosdirac" if needed
+    migration = f"""
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = 'dbos')
+    AND NOT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = 'dbosdirac') THEN
+    ALTER SCHEMA "dbos" RENAME TO "dbosdirac";
+  END IF;
+END $$;
+"""
+
+    # Helper: list of child tables with their columns/PKs for partitioning
+    # Each entry: (table_name, columns_sql, pk_columns, select_columns)
+    child_tables = [
+        (
+            "operation_outputs",
+            """
+    workflow_uuid TEXT NOT NULL,
+    function_id INT4 NOT NULL,
+    function_name TEXT NOT NULL DEFAULT '',
+    output TEXT,
+    error TEXT,
+    child_workflow_id TEXT,
+    started_at_epoch_ms BIGINT,
+    completed_at_epoch_ms BIGINT,
+    serialization TEXT""",
+            "workflow_uuid, function_id",
+            "workflow_uuid, function_id, function_name, output, error, child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms, serialization",
+        ),
+        (
+            "notifications",
+            """
+    destination_uuid TEXT NOT NULL,
+    topic TEXT,
+    message TEXT NOT NULL,
+    created_at_epoch_ms BIGINT NOT NULL DEFAULT (EXTRACT(epoch FROM now()) * 1000.0)::bigint,
+    message_uuid TEXT NOT NULL DEFAULT gen_random_uuid(),
+    serialization TEXT,
+    consumed BOOLEAN NOT NULL DEFAULT FALSE""",
+            "destination_uuid, message_uuid",
+            "destination_uuid, topic, message, created_at_epoch_ms, message_uuid, serialization, consumed",
+        ),
+        (
+            "workflow_events",
+            """
+    workflow_uuid TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    serialization TEXT""",
+            "workflow_uuid, key",
+            "workflow_uuid, key, value, serialization",
+        ),
+        (
+            "workflow_events_history",
+            """
+    workflow_uuid TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    function_id INT4 NOT NULL,
+    serialization TEXT""",
+            "workflow_uuid, key, function_id",
+            "workflow_uuid, key, value, function_id, serialization",
+        ),
+        (
+            "streams",
+            """
+    workflow_uuid TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    "offset" INT4 NOT NULL,
+    function_id INT4 NOT NULL DEFAULT 0,
+    serialization TEXT""",
+            'workflow_uuid, key, "offset"',
+            'workflow_uuid, key, value, "offset", function_id, serialization',
+        ),
+    ]
+
+    # The partition key column for each table
+    partition_key = {
+        "workflow_status": "workflow_uuid",
+        "operation_outputs": "workflow_uuid",
+        "notifications": "destination_uuid",
+        "workflow_events": "workflow_uuid",
+        "workflow_events_history": "workflow_uuid",
+        "streams": "workflow_uuid",
+    }
+
+    # Step 5b: Convert workflow_status to partitioned table (or create fresh)
+    # Process workflow_status first (parent table), then child tables.
+    # For existing installs, drop FK constraints on child tables before renaming workflow_status.
+
+    # Drop FK constraints on all child tables first (for existing installs)
+    migration += f"""
+DO $$ BEGIN
+  -- Drop all foreign key constraints referencing workflow_status before converting it
+  IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = '{schema}' AND tablename = 'workflow_status')
+    AND NOT EXISTS (SELECT 1 FROM pg_partitioned_table pt
+                    JOIN pg_class c ON pt.partrelid = c.oid
+                    JOIN pg_namespace n ON c.relnamespace = n.oid
+                    WHERE n.nspname = '{schema}' AND c.relname = 'workflow_status') THEN
+    -- Drop FK constraints from child tables
+    DECLARE
+      r RECORD;
+    BEGIN
+      FOR r IN
+        SELECT conname, conrelid::regclass AS tablename
+        FROM pg_constraint
+        WHERE confrelid = '"{schema}".workflow_status'::regclass
+          AND contype = 'f'
+      LOOP
+        EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', r.tablename, r.conname);
+      END LOOP;
+    END;
+  END IF;
+END $$;
+"""
+
+    # Convert workflow_status
+    migration += f"""
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = '{schema}' AND tablename = 'workflow_status')
+    AND NOT EXISTS (SELECT 1 FROM pg_partitioned_table pt
+                    JOIN pg_class c ON pt.partrelid = c.oid
+                    JOIN pg_namespace n ON c.relnamespace = n.oid
+                    WHERE n.nspname = '{schema}' AND c.relname = 'workflow_status') THEN
+    -- Existing non-partitioned table: rename, create partitioned, migrate data, drop old
+    ALTER TABLE "{schema}".workflow_status RENAME TO workflow_status_old;
+
+    -- Drop the unique constraint that is incompatible with partitioning
+    BEGIN
+      ALTER TABLE "{schema}".workflow_status_old DROP CONSTRAINT IF EXISTS uq_workflow_status_queue_name_dedup_id;
+    EXCEPTION WHEN undefined_object THEN NULL;
+    END;
+
+    -- Drop old indexes to avoid name conflicts
+    DROP INDEX IF EXISTS "{schema}".workflow_status_created_at_index;
+    DROP INDEX IF EXISTS "{schema}".workflow_status_executor_id_index;
+    DROP INDEX IF EXISTS "{schema}".workflow_status_status_index;
+
+    CREATE TABLE "{schema}".workflow_status (
+        workflow_uuid TEXT NOT NULL,
+        status TEXT,
+        name TEXT,
+        authenticated_user TEXT,
+        assumed_role TEXT,
+        authenticated_roles TEXT,
+        output TEXT,
+        error TEXT,
+        executor_id TEXT,
+        created_at BIGINT NOT NULL DEFAULT (EXTRACT(epoch FROM now()) * 1000.0)::bigint,
+        updated_at BIGINT NOT NULL DEFAULT (EXTRACT(epoch FROM now()) * 1000.0)::bigint,
+        application_version TEXT,
+        application_id TEXT,
+        class_name VARCHAR(255) DEFAULT NULL,
+        config_name VARCHAR(255) DEFAULT NULL,
+        recovery_attempts BIGINT DEFAULT 0,
+        queue_name TEXT,
+        workflow_timeout_ms BIGINT,
+        workflow_deadline_epoch_ms BIGINT,
+        inputs TEXT,
+        started_at_epoch_ms BIGINT,
+        deduplication_id TEXT,
+        priority INT4 NOT NULL DEFAULT 0,
+        queue_partition_key TEXT,
+        forked_from TEXT,
+        owner_xid TEXT,
+        parent_workflow_id TEXT,
+        serialization TEXT,
+        PRIMARY KEY (workflow_uuid)
+    ) PARTITION BY RANGE (workflow_uuid);
+
+    CREATE TABLE "{schema}".workflow_status_default PARTITION OF "{schema}".workflow_status DEFAULT;
+
+    CREATE INDEX workflow_status_created_at_index ON "{schema}".workflow_status (created_at);
+    CREATE INDEX workflow_status_executor_id_index ON "{schema}".workflow_status (executor_id);
+    CREATE INDEX workflow_status_status_index ON "{schema}".workflow_status (status);
+
+    INSERT INTO "{schema}".workflow_status (
+        workflow_uuid, status, name, authenticated_user, assumed_role,
+        authenticated_roles, output, error, executor_id,
+        created_at, updated_at, application_version, application_id,
+        class_name, config_name, recovery_attempts, queue_name,
+        workflow_timeout_ms, workflow_deadline_epoch_ms, inputs,
+        started_at_epoch_ms, deduplication_id, priority,
+        queue_partition_key, forked_from, owner_xid, parent_workflow_id,
+        serialization
+    )
+    SELECT
+        workflow_uuid, status, name, authenticated_user, assumed_role,
+        authenticated_roles, output, error, executor_id,
+        created_at, updated_at, application_version, application_id,
+        class_name, config_name, recovery_attempts, queue_name,
+        workflow_timeout_ms, workflow_deadline_epoch_ms, inputs,
+        started_at_epoch_ms, deduplication_id, priority,
+        queue_partition_key, forked_from, owner_xid, parent_workflow_id,
+        serialization
+    FROM "{schema}".workflow_status_old;
+    DROP TABLE "{schema}".workflow_status_old CASCADE;
+
+  ELSIF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = '{schema}' AND tablename = 'workflow_status') THEN
+    -- Fresh install: create partitioned table directly
+    CREATE TABLE "{schema}".workflow_status (
+        workflow_uuid TEXT NOT NULL,
+        status TEXT,
+        name TEXT,
+        authenticated_user TEXT,
+        assumed_role TEXT,
+        authenticated_roles TEXT,
+        output TEXT,
+        error TEXT,
+        executor_id TEXT,
+        created_at BIGINT NOT NULL DEFAULT (EXTRACT(epoch FROM now()) * 1000.0)::bigint,
+        updated_at BIGINT NOT NULL DEFAULT (EXTRACT(epoch FROM now()) * 1000.0)::bigint,
+        application_version TEXT,
+        application_id TEXT,
+        class_name VARCHAR(255) DEFAULT NULL,
+        config_name VARCHAR(255) DEFAULT NULL,
+        recovery_attempts BIGINT DEFAULT 0,
+        queue_name TEXT,
+        workflow_timeout_ms BIGINT,
+        workflow_deadline_epoch_ms BIGINT,
+        inputs TEXT,
+        started_at_epoch_ms BIGINT,
+        deduplication_id TEXT,
+        priority INT4 NOT NULL DEFAULT 0,
+        queue_partition_key TEXT,
+        forked_from TEXT,
+        owner_xid TEXT,
+        parent_workflow_id TEXT,
+        serialization TEXT,
+        PRIMARY KEY (workflow_uuid)
+    ) PARTITION BY RANGE (workflow_uuid);
+
+    CREATE TABLE "{schema}".workflow_status_default PARTITION OF "{schema}".workflow_status DEFAULT;
+
+    CREATE INDEX workflow_status_created_at_index ON "{schema}".workflow_status (created_at);
+    CREATE INDEX workflow_status_executor_id_index ON "{schema}".workflow_status (executor_id);
+    CREATE INDEX workflow_status_status_index ON "{schema}".workflow_status (status);
+  END IF;
+  -- If table already exists AND is partitioned, skip (idempotent)
+END $$;
+"""
+
+    # Convert each child table
+    for table_name, columns_sql, pk_columns, select_columns in child_tables:
+        pk = partition_key[table_name]
+        migration += f"""
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = '{schema}' AND tablename = '{table_name}')
+    AND NOT EXISTS (SELECT 1 FROM pg_partitioned_table pt
+                    JOIN pg_class c ON pt.partrelid = c.oid
+                    JOIN pg_namespace n ON c.relnamespace = n.oid
+                    WHERE n.nspname = '{schema}' AND c.relname = '{table_name}') THEN
+    -- Existing non-partitioned table: rename, create partitioned, migrate data, drop old
+    ALTER TABLE "{schema}".{table_name} RENAME TO {table_name}_old;
+
+    CREATE TABLE "{schema}".{table_name} (
+        {columns_sql},
+        PRIMARY KEY ({pk_columns})
+    ) PARTITION BY RANGE ({pk});
+
+    CREATE TABLE "{schema}".{table_name}_default PARTITION OF "{schema}".{table_name} DEFAULT;
+
+    INSERT INTO "{schema}".{table_name} ({select_columns})
+    SELECT {select_columns} FROM "{schema}".{table_name}_old;
+    DROP TABLE "{schema}".{table_name}_old CASCADE;
+
+  ELSIF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = '{schema}' AND tablename = '{table_name}') THEN
+    -- Fresh install: create partitioned table directly
+    CREATE TABLE "{schema}".{table_name} (
+        {columns_sql},
+        PRIMARY KEY ({pk_columns})
+    ) PARTITION BY RANGE ({pk});
+
+    CREATE TABLE "{schema}".{table_name}_default PARTITION OF "{schema}".{table_name} DEFAULT;
+  END IF;
+END $$;
+"""
+
+    # Add FK constraints on default partitions
+    # These ensure referential integrity for rows that land in the DEFAULT partition
+    # (e.g., user-supplied UUIDs, old-format sched-* IDs)
+    for table_name, columns_sql, pk_columns, select_columns in child_tables:
+        fk_col = partition_key[table_name]
+        migration += f"""
+DO $$ BEGIN
+  BEGIN
+    ALTER TABLE "{schema}".{table_name}_default
+      ADD CONSTRAINT {table_name}_default_wf_fk
+      FOREIGN KEY ({fk_col}) REFERENCES "{schema}".workflow_status_default(workflow_uuid)
+      ON UPDATE CASCADE ON DELETE CASCADE;
+  EXCEPTION WHEN duplicate_object THEN NULL;
+  END;
+END $$;
+"""
+
+    # Recreate indexes on notifications
+    migration += f"""
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes
+    WHERE schemaname = '{schema}' AND tablename = 'notifications' AND indexname = 'idx_workflow_topic'
+  ) THEN
+    CREATE INDEX idx_workflow_topic ON "{schema}".notifications (destination_uuid, topic);
+  END IF;
+END $$;
+"""
+
+    # Step 5c: Recreate PL/pgSQL functions with updated schema name
+    migration += f"""
+CREATE OR REPLACE FUNCTION "{schema}".enqueue_workflow(
+    workflow_name TEXT,
+    queue_name TEXT,
+    positional_args JSON[] DEFAULT ARRAY[]::JSON[],
+    named_args JSON DEFAULT '{{}}'::JSON,
+    class_name TEXT DEFAULT NULL,
+    config_name TEXT DEFAULT NULL,
+    workflow_id TEXT DEFAULT NULL,
+    app_version TEXT DEFAULT NULL,
+    timeout_ms BIGINT DEFAULT NULL,
+    deadline_epoch_ms BIGINT DEFAULT NULL,
+    deduplication_id TEXT DEFAULT NULL,
+    priority INTEGER DEFAULT NULL,
+    queue_partition_key TEXT DEFAULT NULL
+) RETURNS TEXT AS $$
+DECLARE
+    v_workflow_id TEXT;
+    v_serialized_inputs TEXT;
+    v_owner_xid TEXT;
+    v_now BIGINT;
+    v_recovery_attempts INTEGER := 0;
+    v_priority INTEGER;
+BEGIN
+
+    -- Validate required parameters
+    IF workflow_name IS NULL OR workflow_name = '' THEN
+        RAISE EXCEPTION 'Workflow name cannot be null or empty';
+    END IF;
+    IF queue_name IS NULL OR queue_name = '' THEN
+        RAISE EXCEPTION 'Queue name cannot be null or empty';
+    END IF;
+    IF named_args IS NOT NULL AND jsonb_typeof(named_args::jsonb) != 'object' THEN
+        RAISE EXCEPTION 'Named args must be a JSON object';
+    END IF;
+    IF workflow_id IS NOT NULL AND workflow_id = '' THEN
+        RAISE EXCEPTION 'Workflow ID cannot be an empty string if provided.';
+    END IF;
+
+    v_workflow_id := COALESCE(workflow_id, gen_random_uuid()::TEXT);
+    v_owner_xid := gen_random_uuid()::TEXT;
+    v_priority := COALESCE(priority, 0);
+    v_serialized_inputs := json_build_object(
+        'positionalArgs', positional_args,
+        'namedArgs', named_args
+    )::TEXT;
+    v_now := EXTRACT(epoch FROM now()) * 1000;
+
+    INSERT INTO "{schema}".workflow_status (
+        workflow_uuid, status, inputs,
+        name, class_name, config_name,
+        queue_name, deduplication_id, priority, queue_partition_key,
+        application_version,
+        created_at, updated_at, recovery_attempts,
+        workflow_timeout_ms, workflow_deadline_epoch_ms,
+        parent_workflow_id, owner_xid, serialization
+    ) VALUES (
+        v_workflow_id, 'ENQUEUED', v_serialized_inputs,
+        workflow_name, class_name, config_name,
+        queue_name, deduplication_id, v_priority, queue_partition_key,
+        app_version,
+        v_now, v_now, v_recovery_attempts,
+        timeout_ms, deadline_epoch_ms,
+        NULL, v_owner_xid, 'portable_json'
+    )
+    ON CONFLICT (workflow_uuid)
+    DO UPDATE SET
+        updated_at = EXCLUDED.updated_at;
+
+    RETURN v_workflow_id;
+
+EXCEPTION
+    WHEN unique_violation THEN
+        RAISE EXCEPTION 'DBOS queue duplicated'
+            USING DETAIL = format('Workflow %s with queue %s and deduplication ID %s already exists', v_workflow_id, queue_name, deduplication_id),
+                ERRCODE = 'unique_violation';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION "{schema}".send_message(
+    destination_id TEXT,
+    message JSON,
+    topic TEXT DEFAULT NULL,
+    message_id TEXT DEFAULT NULL
+) RETURNS VOID AS $$
+DECLARE
+    v_topic TEXT := COALESCE(topic, '__null__topic__');
+    v_message_id TEXT := COALESCE(message_id, gen_random_uuid()::TEXT);
+BEGIN
+    INSERT INTO "{schema}".notifications (
+        destination_uuid, topic, message, message_uuid, serialization
+    ) VALUES (
+        destination_id, v_topic, message, v_message_id, 'portable_json'
+    )
+    ON CONFLICT (destination_uuid, message_uuid) DO NOTHING;
+EXCEPTION
+    WHEN foreign_key_violation THEN
+        RAISE EXCEPTION 'DBOS non-existent workflow'
+            USING DETAIL = format('Destination workflow %s does not exist', destination_id),
+                ERRCODE = 'foreign_key_violation';
+END;
+$$ LANGUAGE plpgsql;
+"""
+
+    # Step 5d: Recreate triggers
+    if use_listen_notify:
+        migration += f"""
+-- Recreate notification function
+CREATE OR REPLACE FUNCTION "{schema}".notifications_function() RETURNS TRIGGER AS $$
+DECLARE
+    payload text := NEW.destination_uuid || '::' || NEW.topic;
+BEGIN
+    PERFORM pg_notify('dbos_notifications_channel', payload);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Drop and recreate notification trigger on partitioned table
+DROP TRIGGER IF EXISTS dbos_notifications_trigger ON "{schema}".notifications;
+CREATE TRIGGER dbos_notifications_trigger
+AFTER INSERT ON "{schema}".notifications
+FOR EACH ROW EXECUTE FUNCTION "{schema}".notifications_function();
+
+-- Recreate events function
+CREATE OR REPLACE FUNCTION "{schema}".workflow_events_function() RETURNS TRIGGER AS $$
+DECLARE
+    payload text := NEW.workflow_uuid || '::' || NEW.key;
+BEGIN
+    PERFORM pg_notify('dbos_workflow_events_channel', payload);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Drop and recreate events trigger on partitioned table
+DROP TRIGGER IF EXISTS dbos_workflow_events_trigger ON "{schema}".workflow_events;
+CREATE TRIGGER dbos_workflow_events_trigger
+AFTER INSERT ON "{schema}".workflow_events
+FOR EACH ROW EXECUTE FUNCTION "{schema}".workflow_events_function();
+"""
+
+    # Step 5e: Create maintain_partitions() stored procedure
+    migration += f"""
+CREATE OR REPLACE PROCEDURE "{schema}".maintain_partitions()
+LANGUAGE plpgsql AS $proc$
+DECLARE
+    week_start TIMESTAMP WITH TIME ZONE;
+    week_end TIMESTAMP WITH TIME ZONE;
+    week_label TEXT;
+    uuid_lower TEXT;
+    uuid_upper TEXT;
+    sched_lower TEXT;
+    sched_upper TEXT;
+    epoch_ms_lower BIGINT;
+    epoch_ms_upper BIGINT;
+    hex_lower TEXT;
+    hex_upper TEXT;
+    part_name TEXT;
+    fk_name TEXT;
+    i INTEGER;
+    -- child table info
+    child_table TEXT;
+    child_pk TEXT;
+    child_fk_col TEXT;
+BEGIN
+    -- Create partitions for 1 week in the past through 4 weeks in the future
+    FOR i IN -1..4 LOOP
+        week_start := date_trunc('week', now()) + (i * INTERVAL '1 week');
+        week_end := week_start + INTERVAL '1 week';
+        week_label := to_char(week_start, 'IYYY') || 'w' || lpad(to_char(week_start, 'IW'), 2, '0');
+
+        -- Compute UUIDv7 hex boundaries from epoch milliseconds
+        epoch_ms_lower := (EXTRACT(epoch FROM week_start) * 1000)::BIGINT;
+        epoch_ms_upper := (EXTRACT(epoch FROM week_end) * 1000)::BIGINT;
+        hex_lower := lpad(to_hex(epoch_ms_lower), 12, '0');
+        hex_upper := lpad(to_hex(epoch_ms_upper), 12, '0');
+        -- UUIDv7 format: first 8 hex chars, hyphen, next 4 hex chars, hyphen, '7'
+        uuid_lower := substring(hex_lower from 1 for 8) || '-' || substring(hex_lower from 9 for 4) || '-7';
+        uuid_upper := substring(hex_upper from 1 for 8) || '-' || substring(hex_upper from 9 for 4) || '-7';
+
+        -- Compute sched-* boundaries
+        sched_lower := 'sched-' || to_char(week_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS');
+        sched_upper := 'sched-' || to_char(week_end AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS');
+
+        -- ============ workflow_status partitions ============
+        -- UUIDv7 partition
+        part_name := 'workflow_status_' || week_label || '_uuid';
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = '{schema}' AND c.relname = part_name
+        ) THEN
+            EXECUTE format(
+                'CREATE TABLE "{schema}".%I PARTITION OF "{schema}".workflow_status FOR VALUES FROM (%L) TO (%L)',
+                part_name, uuid_lower, uuid_upper
+            );
+        END IF;
+
+        -- sched-* partition
+        part_name := 'workflow_status_' || week_label || '_sched';
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = '{schema}' AND c.relname = part_name
+        ) THEN
+            EXECUTE format(
+                'CREATE TABLE "{schema}".%I PARTITION OF "{schema}".workflow_status FOR VALUES FROM (%L) TO (%L)',
+                part_name, sched_lower, sched_upper
+            );
+        END IF;
+
+        -- ============ Child table partitions ============
+        FOREACH child_table IN ARRAY ARRAY['operation_outputs', 'workflow_events', 'workflow_events_history', 'streams'] LOOP
+            -- UUIDv7 partition
+            part_name := child_table || '_' || week_label || '_uuid';
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
+                WHERE n.nspname = '{schema}' AND c.relname = part_name
+            ) THEN
+                EXECUTE format(
+                    'CREATE TABLE "{schema}".%I PARTITION OF "{schema}".%I FOR VALUES FROM (%L) TO (%L)',
+                    part_name, child_table, uuid_lower, uuid_upper
+                );
+            END IF;
+
+            -- FK constraint: child -> workflow_status same partition range
+            fk_name := part_name || '_wf_fk';
+            BEGIN
+                EXECUTE format(
+                    'ALTER TABLE "{schema}".%I ADD CONSTRAINT %I FOREIGN KEY (workflow_uuid) REFERENCES "{schema}".%I(workflow_uuid) ON UPDATE CASCADE ON DELETE CASCADE',
+                    part_name, fk_name,
+                    'workflow_status_' || week_label || '_uuid'
+                );
+            EXCEPTION WHEN duplicate_object THEN NULL;
+            END;
+
+            -- sched-* partition
+            part_name := child_table || '_' || week_label || '_sched';
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
+                WHERE n.nspname = '{schema}' AND c.relname = part_name
+            ) THEN
+                EXECUTE format(
+                    'CREATE TABLE "{schema}".%I PARTITION OF "{schema}".%I FOR VALUES FROM (%L) TO (%L)',
+                    part_name, child_table, sched_lower, sched_upper
+                );
+            END IF;
+
+            -- FK constraint for sched partition
+            fk_name := part_name || '_wf_fk';
+            BEGIN
+                EXECUTE format(
+                    'ALTER TABLE "{schema}".%I ADD CONSTRAINT %I FOREIGN KEY (workflow_uuid) REFERENCES "{schema}".%I(workflow_uuid) ON UPDATE CASCADE ON DELETE CASCADE',
+                    part_name, fk_name,
+                    'workflow_status_' || week_label || '_sched'
+                );
+            EXCEPTION WHEN duplicate_object THEN NULL;
+            END;
+        END LOOP;
+
+        -- ============ notifications partitions (partition key is destination_uuid) ============
+        -- UUIDv7 partition
+        part_name := 'notifications_' || week_label || '_uuid';
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = '{schema}' AND c.relname = part_name
+        ) THEN
+            EXECUTE format(
+                'CREATE TABLE "{schema}".%I PARTITION OF "{schema}".notifications FOR VALUES FROM (%L) TO (%L)',
+                part_name, uuid_lower, uuid_upper
+            );
+        END IF;
+
+        fk_name := part_name || '_wf_fk';
+        BEGIN
+            EXECUTE format(
+                'ALTER TABLE "{schema}".%I ADD CONSTRAINT %I FOREIGN KEY (destination_uuid) REFERENCES "{schema}".%I(workflow_uuid) ON UPDATE CASCADE ON DELETE CASCADE',
+                part_name, fk_name,
+                'workflow_status_' || week_label || '_uuid'
+            );
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END;
+
+        -- sched-* partition
+        part_name := 'notifications_' || week_label || '_sched';
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = '{schema}' AND c.relname = part_name
+        ) THEN
+            EXECUTE format(
+                'CREATE TABLE "{schema}".%I PARTITION OF "{schema}".notifications FOR VALUES FROM (%L) TO (%L)',
+                part_name, sched_lower, sched_upper
+            );
+        END IF;
+
+        fk_name := part_name || '_wf_fk';
+        BEGIN
+            EXECUTE format(
+                'ALTER TABLE "{schema}".%I ADD CONSTRAINT %I FOREIGN KEY (destination_uuid) REFERENCES "{schema}".%I(workflow_uuid) ON UPDATE CASCADE ON DELETE CASCADE',
+                part_name, fk_name,
+                'workflow_status_' || week_label || '_sched'
+            );
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END;
+
+    END LOOP;
+END;
+$proc$;
+"""
+
+    # Step 5f: Call maintain_partitions() at end of migration
+    migration += f"""
+CALL "{schema}".maintain_partitions();
+"""
+
+    return migration
+
+
 def get_dbos_migrations(schema: str, use_listen_notify: bool) -> list[str]:
     return [
         get_dbos_migration_one(schema, use_listen_notify),
@@ -458,6 +1082,7 @@ def get_dbos_migrations(schema: str, use_listen_notify: bool) -> list[str]:
         get_dbos_migration_thirteen(schema),
         get_dbos_migration_fourteen(schema),
         get_dbos_migration_fifteen(schema),
+        get_dbos_migration_sixteen(schema, use_listen_notify),
     ]
 
 

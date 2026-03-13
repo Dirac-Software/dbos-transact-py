@@ -292,7 +292,7 @@ def migrate(
         typer.echo(f"Application database: {sa.make_url(application_database_url)}")
     typer.echo(f"System database: {sa.make_url(system_database_url)}")
     if schema is None:
-        schema = "dbos"
+        schema = "dbosdirac"
     typer.echo(f"DBOS system schema: {schema}")
 
     run_dbos_database_migrations(

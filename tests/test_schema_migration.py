@@ -37,11 +37,11 @@ def test_systemdb_migration(dbos: DBOS, skip_with_sqlite: None) -> None:
 
         # Check dbos_migrations table exists, has one row, and has the right version
         migrations_result = connection.execute(
-            sa.text("SELECT version FROM dbos.dbos_migrations")
+            sa.text("SELECT version FROM dbosdirac.dbos_migrations")
         )
         migrations_rows = migrations_result.fetchall()
         assert len(migrations_rows) == 1
-        assert migrations_rows[0][0] == len(get_dbos_migrations("dbos", True))
+        assert migrations_rows[0][0] == len(get_dbos_migrations("dbosdirac", True))
 
 
 def test_systemdb_migration_custom_schema(
@@ -208,7 +208,7 @@ def test_migrate(db_engine: sa.Engine, skip_with_sqlite: None) -> None:
     db_url_string = db_url.render_as_string(hide_password=False)
 
     # Test with different system schema names
-    for schema in ["dbos", "public", "F8nny_sCHem@-n@m3"]:
+    for schema in ["dbosdirac", "public", "F8nny_sCHem@-n@m3"]:
         for use_app_db in [True, False]:
             # Drop the DBOS database if it exists. Create a test role with no permissions.
             with db_engine.connect() as connection:
@@ -422,7 +422,7 @@ def test_concurrent_migrations(db_engine: sa.Engine, skip_with_sqlite: None) -> 
             system_database_url=sys_url,
             engine_kwargs={},
             engine=None,
-            schema="dbos",
+            schema="dbosdirac",
             serializer=DefaultSerializer(),
             executor_id=None,
         )
@@ -431,10 +431,10 @@ def test_concurrent_migrations(db_engine: sa.Engine, skip_with_sqlite: None) -> 
             # Verify migration succeeded
             with sys_db.engine.connect() as conn:
                 rows = conn.execute(
-                    sa.text("SELECT version FROM dbos.dbos_migrations")
+                    sa.text("SELECT version FROM dbosdirac.dbos_migrations")
                 ).fetchall()
                 assert len(rows) == 1
-                assert rows[0][0] == len(get_dbos_migrations("dbos", True))
+                assert rows[0][0] == len(get_dbos_migrations("dbosdirac", True))
         finally:
             sys_db.destroy()
 

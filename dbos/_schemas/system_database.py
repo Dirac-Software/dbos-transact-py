@@ -6,7 +6,6 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     Column,
-    ForeignKey,
     Index,
     Integer,
     MetaData,
@@ -21,7 +20,7 @@ from sqlalchemy import (
 
 class SystemSchema:
     ### System table schema
-    metadata_obj = MetaData(schema="dbos")
+    metadata_obj = MetaData(schema="dbosdirac")
     sysdb_suffix = "_dbos_sys"
 
     @classmethod
@@ -101,9 +100,6 @@ class SystemSchema:
         Column(
             "workflow_uuid",
             Text,
-            ForeignKey(
-                "workflow_status.workflow_uuid", onupdate="CASCADE", ondelete="CASCADE"
-            ),
             nullable=False,
         ),
         Column("function_id", Integer, nullable=False),
@@ -123,9 +119,6 @@ class SystemSchema:
         Column(
             "destination_uuid",
             Text,
-            ForeignKey(
-                "workflow_status.workflow_uuid", onupdate="CASCADE", ondelete="CASCADE"
-            ),
             nullable=False,
         ),
         Column("topic", Text, nullable=True),
@@ -140,11 +133,11 @@ class SystemSchema:
             "message_uuid",
             Text,
             nullable=False,
-            primary_key=True,
             server_default=text("gen_random_uuid()"),
         ),
         Column("serialization", Text()),
         Column("consumed", Boolean, nullable=False, server_default="false"),
+        PrimaryKeyConstraint("destination_uuid", "message_uuid"),
         Index("idx_workflow_topic", "destination_uuid", "topic"),
     )
 
@@ -154,9 +147,6 @@ class SystemSchema:
         Column(
             "workflow_uuid",
             Text,
-            ForeignKey(
-                "workflow_status.workflow_uuid", onupdate="CASCADE", ondelete="CASCADE"
-            ),
             nullable=False,
         ),
         Column("key", Text, nullable=False),
@@ -172,9 +162,6 @@ class SystemSchema:
         Column(
             "workflow_uuid",
             Text,
-            ForeignKey(
-                "workflow_status.workflow_uuid", onupdate="CASCADE", ondelete="CASCADE"
-            ),
             nullable=False,
         ),
         Column("key", Text, nullable=False),
@@ -190,9 +177,6 @@ class SystemSchema:
         Column(
             "workflow_uuid",
             Text,
-            ForeignKey(
-                "workflow_status.workflow_uuid", onupdate="CASCADE", ondelete="CASCADE"
-            ),
             nullable=False,
         ),
         Column("key", Text, nullable=False),

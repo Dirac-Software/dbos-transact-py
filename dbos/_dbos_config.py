@@ -543,7 +543,7 @@ def overwrite_config(provided_config: ConfigFile) -> ConfigFile:
         )
     provided_config["system_database_url"] = system_db_url
     # Always use the "dbos" schema when deploying to DBOS Cloud
-    provided_config["dbos_system_schema"] = "dbos"
+    provided_config["dbos_system_schema"] = "dbosdirac"
 
     # Telemetry config
     if "telemetry" not in provided_config or provided_config["telemetry"] is None:

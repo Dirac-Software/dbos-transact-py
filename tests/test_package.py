@@ -203,7 +203,7 @@ def test_workflow_commands(config: DBOSConfig) -> None:
             ["dbos", "reset", "-y", "--sys-db-url", db_url], cwd=temp_path
         )
 
-        schema = "dbos"
+        schema = "dbosdirac"
         # Get some workflows enqueued on the toolbox, then kill the toolbox
         process = subprocess.Popen(["python3", "main.py"], cwd=temp_path, env=env)
         try:

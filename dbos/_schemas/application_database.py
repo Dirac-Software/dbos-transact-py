@@ -12,7 +12,7 @@ from sqlalchemy import (
 
 
 class ApplicationSchema:
-    schema = "dbos"
+    schema = "dbosdirac"
     metadata_obj = MetaData(schema=schema)
 
     transaction_outputs = Table(

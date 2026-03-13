@@ -143,7 +143,7 @@ class DBOSClient:
         system_database_url: Optional[str] = None,
         system_database_engine: Optional[sa.Engine] = None,
         application_database_url: Optional[str] = None,
-        dbos_system_schema: Optional[str] = "dbos",
+        dbos_system_schema: Optional[str] = "dbosdirac",
         serializer: Serializer = DefaultSerializer(),
     ):
         self._serializer = serializer

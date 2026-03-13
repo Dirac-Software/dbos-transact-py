@@ -468,7 +468,7 @@ class SystemDatabase(ABC):
         if system_database_url.startswith("sqlite"):
             self.schema = None
         else:
-            self.schema = schema if schema else "dbos"
+            self.schema = schema if schema else "dbosdirac"
         SystemSchema.set_schema(self.schema)
 
         if engine:
@@ -1677,6 +1677,7 @@ class SystemDatabase(ABC):
                     )
                     .on_conflict_do_nothing(
                         index_elements=[
+                            SystemSchema.notifications.c.destination_uuid,
                             SystemSchema.notifications.c.message_uuid,
                         ]
                     )
@@ -1735,6 +1736,7 @@ class SystemDatabase(ABC):
                     )
                     .on_conflict_do_nothing(
                         index_elements=[
+                            SystemSchema.notifications.c.destination_uuid,
                             SystemSchema.notifications.c.message_uuid,
                         ]
                     )
