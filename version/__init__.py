@@ -1,4 +1,8 @@
+import sys
 from pdm.backend.hooks.version import SCMVersion
+
+# DBOS uses UUIDv7, but only in Python 3.14 and later
+assert sys.version_info >= (3, 14)
 
 
 def format_version(git_version: SCMVersion) -> str:
@@ -38,6 +42,9 @@ def format_version(git_version: SCMVersion) -> str:
 
 
 def guess_next_version(version_number: str) -> str:
-    major, minor, patch = map(int, version_number.split("."))
+    parts = list(map(int, version_number.split(".")))
+    while len(parts) < 3:
+        parts.append(0)
+    major, minor, patch = parts[0], parts[1], parts[2]
     minor += 1
     return f"{major}.{minor}.{patch}"
